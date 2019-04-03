@@ -71,9 +71,8 @@ void setup() {
 void beep() {
     digitalWrite(SOUND_PIN, HIGH);
     digitalWrite(LED_PIN, LOW);
-    delay(1);
+    delay(5);
     digitalWrite(SOUND_PIN, LOW);
-    delay(4);
     digitalWrite(LED_PIN, HIGH);
 }
 
