@@ -1,13 +1,22 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <math.h>
+#include <TM1637Display.h>
 
-// Direct GPIO mapping for Seeed Studio XIAO ESP32-C6 / ESP32
-#define SOUND_PIN 20  // GPIO20 (D9) -> Transistor Base driving piezo
-#define LED_PIN   15  // GPIO15     -> On-board User LED
+// Direct GPIO mapping for Seeed Studio XIAO ESP32-C6
+// XIAO C6 Pin Map:
+//   D6  = GPIO16 (UART TX)
+//   D7  = GPIO17 (UART RX) -> DIO
+//   D8  = GPIO19 (SPI SCK) -> CLK
+//   D9  = GPIO20 (SPI MISO) -> Piezo/Sound
+#define SOUND_PIN 20  // GPIO20 (D9 on XIAO C6) -> Transistor Base driving piezo
+#define LED_PIN   15  // GPIO15                 -> On-board LED
+#define CLK_PIN   19  // GPIO19 (D8 on XIAO C6) -> TM1637 CLK
+#define DIO_PIN   17  // GPIO17 (D7 on XIAO C6) -> TM1637 DIO
 
-#define IS_SINGLE_NETWORK false
-#define SINGLE_NETWORK_SSID String("myhomewifi")
+
+#define IS_SINGLE_NETWORK true
+#define SINGLE_NETWORK_SSID String("ultracube")
 #define IS_PRINT_NETWORKS false
 
 // --- Fixed Acoustic Properties ---
@@ -24,6 +33,8 @@ volatile float currentDelay    = MAX_DELAY_IDLE_MS;
 volatile bool isScanning       = false;
 
 unsigned long lastBeep = 0;
+
+TM1637Display display(CLK_PIN, DIO_PIN);
 
 void generateCurrentDelay() {
     long upperBound = max(7L, (long)currentMaxDelay);
@@ -47,6 +58,9 @@ void processScanResults(int networksFound) {
             Serial.printf("SSID: %s | RSSI: %d dBm\n", WiFi.SSID(i).c_str(), rssi);
         }
     }
+
+    uint8_t colonMask =  0x00; 
+    display.showNumberDecEx(abs(strongestRSSI), colonMask, true, 4, 0);
 
     // Clean up scanner memory
     WiFi.scanDelete();
@@ -88,6 +102,17 @@ void setup() {
 
     digitalWrite(SOUND_PIN, LOW);
     digitalWrite(LED_PIN, HIGH); // LED OFF
+
+    // Fix for TM1637 on ESP32: Ensure GPIO output latches are LOW and internal pull-ups are enabled
+    // Global object construction occurs before Arduino core GPIO initialization, causing lost state.
+    pinMode(CLK_PIN, INPUT_PULLUP);
+    pinMode(DIO_PIN, INPUT_PULLUP);
+    digitalWrite(CLK_PIN, LOW);
+    digitalWrite(DIO_PIN, LOW);
+
+    display.setBrightness(7, true);
+    display.clear();
+    display.showNumberDecEx(8888, 0, true, 4, 0);
 
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
