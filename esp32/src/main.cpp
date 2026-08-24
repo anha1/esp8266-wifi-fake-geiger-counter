@@ -32,9 +32,16 @@ volatile float currentMaxDelay = MAX_DELAY_IDLE_MS;
 volatile float currentDelay    = MAX_DELAY_IDLE_MS;
 volatile bool isScanning       = false;
 
+unsigned long scanCount = 0;
+int lastRSSI = 8888;
 unsigned long lastBeep = 0;
 
 TM1637Display display(CLK_PIN, DIO_PIN);
+
+void updateDisplay(bool colonOn) {
+    uint8_t colonMask = colonOn ? 0x40 : 0x00; 
+    display.showNumberDecEx(abs(lastRSSI), colonMask, true, 4, 0);
+}
 
 void generateCurrentDelay() {
     long upperBound = max(7L, (long)currentMaxDelay);
@@ -42,6 +49,7 @@ void generateCurrentDelay() {
 }
 
 void processScanResults(int networksFound) {
+    updateDisplay(scanCount++ % 2);
     int strongestRSSI = -100; // Weak signal baseline
 
     for (int i = 0; i < networksFound; i++) {
@@ -59,8 +67,9 @@ void processScanResults(int networksFound) {
         }
     }
 
-    uint8_t colonMask =  0x00; 
-    display.showNumberDecEx(abs(strongestRSSI), colonMask, true, 4, 0);
+    lastRSSI = strongestRSSI;
+    // Scan complete -> Colon OFF
+    
 
     // Clean up scanner memory
     WiFi.scanDelete();
@@ -77,20 +86,19 @@ void processScanResults(int networksFound) {
 
     Serial.printf("Strongest RSSI: %d dBm | MaxDelay: %.0f ms\n", strongestRSSI, currentMaxDelay);
 
-    // Restart non-blocking scan
     WiFi.scanNetworks(true);
     isScanning = true;
 }
 
 void click(int durationMs) {
     // Single fixed-frequency acoustic click
-    tone(SOUND_PIN, BEEP_TONE_FREQ, durationMs);
+    //tone(SOUND_PIN, BEEP_TONE_FREQ, durationMs);
 
     // Active LOW LED flash
-    //digitalWrite(SOUND_PIN, HIGH);  
+    digitalWrite(SOUND_PIN, HIGH);  
     digitalWrite(LED_PIN, LOW);   
     delay(durationMs);             
-    //digitalWrite(SOUND_PIN, LOW);          
+    digitalWrite(SOUND_PIN, LOW);          
     digitalWrite(LED_PIN, HIGH);  
 }
 
@@ -112,16 +120,16 @@ void setup() {
 
     display.setBrightness(7, true);
     display.clear();
-    display.showNumberDecEx(8888, 0, true, 4, 0);
 
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
 
     delay(100);
 
-    // Start background scan
+    // Start background scan -> Colon ON
     WiFi.scanNetworks(true);
     isScanning = true;
+    updateDisplay(true);
 
     generateCurrentDelay();
 }
@@ -155,6 +163,7 @@ void loop() {
         } else if (scanStatus == WIFI_SCAN_FAILED) {
             WiFi.scanDelete();
             WiFi.scanNetworks(true);
+            updateDisplay(true);
         }
     }
 }
