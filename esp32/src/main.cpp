@@ -1,22 +1,27 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <Wire.h>
 #include <math.h>
-#include <TM1637Display.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
 // Direct GPIO mapping for Seeed Studio XIAO ESP32-C6
 // XIAO C6 Pin Map:
 //   D6  = GPIO16 (UART TX)
-//   D7  = GPIO17 (UART RX) -> DIO
-//   D8  = GPIO19 (SPI SCK) -> CLK
+//   D7  = GPIO17 (UART RX) -> OLED SDA (default)
+//   D8  = GPIO19 (SPI SCK) -> OLED SCL (default)
 //   D9  = GPIO20 (SPI MISO) -> Piezo/Sound
-#define SOUND_PIN 20  // GPIO20 (D9 on XIAO C6) -> Transistor Base driving piezo
-#define LED_PIN   15  // GPIO15                 -> On-board LED
-#define CLK_PIN   19  // GPIO19 (D8 on XIAO C6) -> TM1637 CLK
-#define DIO_PIN   17  // GPIO17 (D7 on XIAO C6) -> TM1637 DIO
+#define SOUND_PIN   20  // GPIO20 (D9 on XIAO C6) -> Transistor Base driving piezo
+#define LED_PIN     15  // GPIO15                 -> On-board LED
+#define OLED_PIN_D7 17  // GPIO17 (D7 on XIAO C6)
+#define OLED_PIN_D8 19  // GPIO19 (D8 on XIAO C6)
 
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 32
+#define OLED_RESET    -1
 
 #define IS_SINGLE_NETWORK true
-#define SINGLE_NETWORK_SSID String("ultracube")
+#define SINGLE_NETWORK_SSID String("mynet")
 #define IS_PRINT_NETWORKS false
 
 // --- Fixed Acoustic Properties ---
@@ -33,14 +38,158 @@ volatile float currentDelay    = MAX_DELAY_IDLE_MS;
 volatile bool isScanning       = false;
 
 unsigned long scanCount = 0;
-int lastRSSI = 8888;
+int lastRSSI = -100;
 unsigned long lastBeep = 0;
 
-TM1637Display display(CLK_PIN, DIO_PIN);
+int activeSDA = OLED_PIN_D7;
+int activeSCL = OLED_PIN_D8;
+uint8_t activeOledAddr = 0x3C;
+bool oledFound = false;
 
-void updateDisplay(bool colonOn) {
-    uint8_t colonMask = colonOn ? 0x40 : 0x00; 
-    display.showNumberDecEx(abs(lastRSSI), colonMask, true, 4, 0);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+bool checkI2CAddress(uint8_t addr) {
+    Wire.beginTransmission(addr);
+    return (Wire.endTransmission() == 0);
+}
+
+void initOLED() {
+    // 1. Try candidate 1: D7 = SDA, D8 = SCL
+    Wire.begin(OLED_PIN_D7, OLED_PIN_D8, 400000);
+    delay(20);
+    if (checkI2CAddress(0x3C)) {
+        activeSDA = OLED_PIN_D7;
+        activeSCL = OLED_PIN_D8;
+        activeOledAddr = 0x3C;
+        oledFound = true;
+    } else if (checkI2CAddress(0x3D)) {
+        activeSDA = OLED_PIN_D7;
+        activeSCL = OLED_PIN_D8;
+        activeOledAddr = 0x3D;
+        oledFound = true;
+    } else {
+        // 2. Try candidate 2: D8 = SDA, D7 = SCL (swapped wiring)
+        Wire.end();
+        Wire.begin(OLED_PIN_D8, OLED_PIN_D7, 400000);
+        delay(20);
+        if (checkI2CAddress(0x3C)) {
+            activeSDA = OLED_PIN_D8;
+            activeSCL = OLED_PIN_D7;
+            activeOledAddr = 0x3C;
+            oledFound = true;
+        } else if (checkI2CAddress(0x3D)) {
+            activeSDA = OLED_PIN_D8;
+            activeSCL = OLED_PIN_D7;
+            activeOledAddr = 0x3D;
+            oledFound = true;
+        }
+    }
+
+    if (oledFound) {
+        Serial.printf("[OLED] Detected SSD1306 at 0x%02X (SDA=GPIO%d, SCL=GPIO%d)\n",
+                      activeOledAddr, activeSDA, activeSCL);
+        if (!display.begin(SSD1306_SWITCHCAPVCC, activeOledAddr, false, false)) {
+            Serial.println("[OLED] SSD1306 display.begin() failed!");
+            oledFound = false;
+        }
+    } else {
+        Serial.println("[OLED] Warning: No OLED detected at 0x3C/0x3D on D7/D8. Defaulting to D7=SDA, D8=SCL.");
+        Wire.end();
+        Wire.begin(OLED_PIN_D7, OLED_PIN_D8, 400000);
+        display.begin(SSD1306_SWITCHCAPVCC, 0x3C, false, false);
+    }
+}
+
+void showSplashScreen() {
+    if (!oledFound) return;
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+
+    display.setTextSize(1);
+    display.setCursor(18, 2);
+    display.print(F("RAD-RADAR C6"));
+
+    display.drawFastHLine(0, 12, 128, SSD1306_WHITE);
+
+    display.setCursor(4, 16);
+    if (oledFound) {
+        display.printf("OLED:0x%02X D%d/D%d", activeOledAddr,
+                       (activeSDA == OLED_PIN_D7 ? 7 : 8),
+                       (activeSCL == OLED_PIN_D8 ? 8 : 7));
+    } else {
+        display.print(F("OLED: Not Found"));
+    }
+
+    display.setCursor(4, 24);
+    display.print(F("Starting scan..."));
+    display.display();
+}
+
+#define GRAPH_CAPACITY 80
+int rssiHistory[GRAPH_CAPACITY];
+int historyHead = 0;
+int historyCount = 0;
+
+void addHistory(int val) {
+    rssiHistory[historyHead] = val;
+    historyHead = (historyHead + 1) % GRAPH_CAPACITY;
+    if (historyCount < GRAPH_CAPACITY) {
+        historyCount++;
+    }
+}
+
+int getHistory(int indexFromOldest) {
+    int start = (historyCount < GRAPH_CAPACITY) ? 0 : historyHead;
+    int idx = (start + indexFromOldest) % GRAPH_CAPACITY;
+    return rssiHistory[idx];
+}
+
+void updateDisplay() {
+    if (!oledFound) return;
+
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+
+    // 1. Left side: Extra-large numeric readout
+    if (lastRSSI <= -100) {
+        display.setTextSize(4);
+        display.setCursor(0, 2);
+        display.print(F("--"));
+    } else {
+        int val = abs(lastRSSI);
+        String s = String(val);
+        if (s.length() <= 2) {
+            display.setTextSize(4);
+            display.setCursor(0, 2);
+            display.print(s);
+        } else {
+            display.setTextSize(3);
+            display.setCursor(0, 5);
+            display.print(s);
+        }
+    }
+
+    // 2. Right side: Borderless edge-to-edge Historical Chart (x=48 to 127, y=0 to 31)
+    if (historyCount > 0) {
+        int prevX = -1;
+        int prevY = -1;
+
+        for (int i = 0; i < historyCount; i++) {
+            int val = getHistory(i);
+            int constrained = constrain(val, -95, -30);
+            int y = map(constrained, -95, -30, 31, 0);
+            int x = 127 - (historyCount - 1 - i);
+
+            display.drawPixel(x, y, SSD1306_WHITE);
+            if (prevX != -1) {
+                display.drawLine(prevX, prevY, x, y, SSD1306_WHITE);
+            }
+            prevX = x;
+            prevY = y;
+        }
+    }
+
+    display.display();
 }
 
 void generateCurrentDelay() {
@@ -49,7 +198,6 @@ void generateCurrentDelay() {
 }
 
 void processScanResults(int networksFound) {
-    updateDisplay(scanCount++ % 2);
     int strongestRSSI = -100; // Weak signal baseline
 
     for (int i = 0; i < networksFound; i++) {
@@ -68,8 +216,8 @@ void processScanResults(int networksFound) {
     }
 
     lastRSSI = strongestRSSI;
-    // Scan complete -> Colon OFF
-    
+    addHistory(strongestRSSI);
+    scanCount++;
 
     // Clean up scanner memory
     WiFi.scanDelete();
@@ -86,13 +234,15 @@ void processScanResults(int networksFound) {
 
     Serial.printf("Strongest RSSI: %d dBm | MaxDelay: %.0f ms\n", strongestRSSI, currentMaxDelay);
 
+    updateDisplay();
+
     WiFi.scanNetworks(true);
     isScanning = true;
 }
 
 void click(int durationMs) {
     // Single fixed-frequency acoustic click
-    //tone(SOUND_PIN, BEEP_TONE_FREQ, durationMs);
+    // tone(SOUND_PIN, BEEP_TONE_FREQ, durationMs);
 
     // Active LOW LED flash
     digitalWrite(SOUND_PIN, HIGH);  
@@ -111,25 +261,19 @@ void setup() {
     digitalWrite(SOUND_PIN, LOW);
     digitalWrite(LED_PIN, HIGH); // LED OFF
 
-    // Fix for TM1637 on ESP32: Ensure GPIO output latches are LOW and internal pull-ups are enabled
-    // Global object construction occurs before Arduino core GPIO initialization, causing lost state.
-    pinMode(CLK_PIN, INPUT_PULLUP);
-    pinMode(DIO_PIN, INPUT_PULLUP);
-    digitalWrite(CLK_PIN, LOW);
-    digitalWrite(DIO_PIN, LOW);
-
-    display.setBrightness(7, true);
-    display.clear();
+    // Initialize OLED with pin auto-detection on D7/D8
+    initOLED();
+    showSplashScreen();
 
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
 
-    delay(100);
+    delay(1000); // Allow splash screen to be visible briefly
 
-    // Start background scan -> Colon ON
+    // Start background scan
     WiFi.scanNetworks(true);
     isScanning = true;
-    updateDisplay(true);
+    updateDisplay();
 
     generateCurrentDelay();
 }
@@ -163,7 +307,6 @@ void loop() {
         } else if (scanStatus == WIFI_SCAN_FAILED) {
             WiFi.scanDelete();
             WiFi.scanNetworks(true);
-            updateDisplay(true);
         }
     }
 }
